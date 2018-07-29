@@ -71,6 +71,9 @@ def abstract_model_xy(sess, hps, feeds, train_iterator, test_iterator, data_init
     else:
         with Z.arg_scope([Z.get_variable_ddi, Z.actnorm], init=True):
             results_init = f_loss(None, True, reuse=True)
+
+        # !!! all global variables are initialized using `results_init`
+        # So, Z.get_variable_ddi(..., init=True) is default.
         sess.run(tf.global_variables_initializer())
         sess.run(results_init, {feeds['x']: data_init['x'],
                                 feeds['y']: data_init['y']})
@@ -85,6 +88,7 @@ def codec(hps):
         eps = []
         for i in range(hps.n_levels):
             z, objective = revnet2d(str(i), z, objective, hps)
+            # skip last level
             if i < hps.n_levels-1:
                 z, objective, _eps = split2d("pool"+str(i), z, objective=objective)
                 eps.append(_eps)
@@ -106,6 +110,7 @@ def prior(name, y_onehot, hps):
     with tf.variable_scope(name):
         n_z = hps.top_shape[-1]
 
+        # h: (b, h, w, 2c)
         h = tf.zeros([tf.shape(y_onehot)[0]]+hps.top_shape[:2]+[2*n_z])
         if hps.learntop:
             h = Z.conv2d_zeros('p', h, 2*n_z)
@@ -166,12 +171,20 @@ def model(sess, hps, train_iterator, test_iterator, data_init):
             y_onehot = tf.cast(tf.one_hot(y, hps.n_y, 1, 0), 'float32')
 
             # Discrete -> Continuous
+            # objective: (batch,)
             objective = tf.zeros_like(x, dtype='float32')[:, 0, 0, 0]
             z = preprocess(x)
+
+            # hat_z = z + u,   u ~ Uniform(0, a)
             z = z + tf.random_uniform(tf.shape(z), 0, 1./hps.n_bins)
+
+            # c = - M * log(a),  M is dimensionlity of x, a is the discretization level
+            # a = 1/hps.n_bits_x
+            # here objective is postive, so:
             objective += - np.log(hps.n_bins) * np.prod(Z.int_shape(z)[1:])
 
             # Encode
+            # z: (batch, height, weight, channel) -> (b, h/2, w/2, c * 2 * 2)
             z = Z.squeeze2d(z, 2)  # > 16x16x12
             z, objective, _ = encoder(z, objective)
 
@@ -329,6 +342,7 @@ def checkpoint(z, logdet):
     return z, logdet
 
 
+# multi-scale architecture
 @add_arg_scope
 def revnet2d(name, z, logdet, hps, reverse=False):
     with tf.variable_scope(name):
@@ -364,11 +378,49 @@ def revnet2d_step(name, z, logdet, hps, reverse):
             else:
                 raise Exception()
 
+            #
+            # coupling layer
+            #
+            # We assume y = f(x) and d(y)/d(x) is one upper(or lower) matrix.
+            # So, we need to design f.
+            #
+            # Let f to be following:
+            #   y_1 = x_1
+            #   y_2 = g(x_2, m(x_1))
+            # then,
+            #   d(y)/d(x) = | d(y_1)/d(x_1)   d(y_1)/d(x_2) |
+            #               | d(y_2)/d(x_1)   d(y_2)/d(x_2) |
+            #
+            #             = |       I               0       |
+            #               | d(y_2)/d(x_1)   d(y_2)/d(x_2) |
+            #
+            # so, det( d(y)/d(x) ) = det( d(y_2)/d(x_2) )
+            #
+            # Now, we only need to design g(a, b).
+            #
+            # * Additive coupling
+            #   g(a, b) = a + b
+            #   d(y_2)/d(x_2) = 1
+            #
+            # * Multiplicative coupling
+            #   g(a, b) = a * b
+            #   d(y_2)/d(x_2) = b
+            #
+            # * Affine coupling
+            #   g(a, b) = a * b_1 + b_2
+            #   d(y_2)/d(x_2) = b_1
+
+            # affine coupling layer
+            #
+            # {{
+            # split
             z1 = z[:, :, :, :n_z // 2]
             z2 = z[:, :, :, n_z // 2:]
 
+            # additive coupling
             if hps.flow_coupling == 0:
                 z2 += f("f1", z1, hps.width)
+            # affine coupling
             elif hps.flow_coupling == 1:
                 h = f("f1", z1, hps.width, n_z)
                 shift = h[:, :, :, 0::2]
@@ -381,6 +433,7 @@ def revnet2d_step(name, z, logdet, hps, reverse):
                 raise Exception()
 
             z = tf.concat([z1, z2], 3)
+            # }}
 
         else:
 
@@ -549,6 +602,12 @@ def split2d(name, z, objective=0.):
         z1 = z[:, :, :, :n_z // 2]
         z2 = z[:, :, :, n_z // 2:]
         pz = split2d_prior(z1)
+
+        # \log(p(x)) = \log(p(z)) + \sum_i \log \big( | \det( \frac{\partial{h_i}}{\partial{h_{i-1}}} )| \big)
+        # pz.logp(z2) is the log(p(z))
+        # Here is just one level.
+        # For all levels, the last result is
+        # r = \sum_i log(p(z_i)),  i is the level number
         objective += pz.logp(z2)
         z1 = Z.squeeze2d(z1)
         eps = pz.get_eps(z2)

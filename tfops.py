@@ -69,6 +69,7 @@ def get_variable_ddi(name, shape, initial_value, dtype=tf.float32, init=False, t
 
 @add_arg_scope
 def actnorm(name, x, scale=1., logdet=None, logscale_factor=3., batch_variance=False, reverse=False, init=False, trainable=True):
+    # x: (b, h/2, w/2, c * 2 * 2)
     if arg_scope([get_variable_ddi], trainable=trainable):
         if not reverse:
             x = actnorm_center(name+"_center", x, reverse)
@@ -124,6 +125,7 @@ def actnorm_scale(name, x, scale=1., logdet=None, logscale_factor=3., batch_vari
             _shape = (1, int_shape(x)[1])
 
         elif len(shape) == 4:
+            # !!! x_var: (1, 1, 1, c * 2 * 2)
             x_var = tf.reduce_mean(x**2, [0, 1, 2], keepdims=True)
             logdet_factor = int(shape[1])*int(shape[2])
             _shape = (1, 1, 1, int_shape(x)[3])
@@ -137,10 +139,27 @@ def actnorm_scale(name, x, scale=1., logdet=None, logscale_factor=3., batch_vari
             # Somehow this also slows down graph when not initializing
             # (it's not optimized away?)
 
+        #
+        # {{
+        # s * x is batch normalization
+        # log(s) = log( \frac{scale}{\sqrt{var(x) + eps}} )
+        #
+        # var(x) is (1, 1, 1, c * 2 * 2)
+        # s * x is equally to s_v * x_v
+        # s_v is diag{var(s)_1, ..., var(s)_(s*2*2)}
+        # x_v is (-1, c * 2 * 2)
+        # so, log( det( d(s * x)/d(x) ) ) = log(det(s)) = h * w * sum(log(s)))
+        #
         if True:
+            # build log(s)
             logs = get_variable_ddi("logs", _shape, initial_value=tf.log(
                 scale/(tf.sqrt(x_var)+1e-6))/logscale_factor)*logscale_factor
             if not reverse:
+                #
+                # b = 0
+                # s = exp(log(s))
+                # z = s * x + b
+                #
                 x = x * tf.exp(logs)
             else:
                 x = x * tf.exp(-logs)
@@ -158,7 +177,9 @@ def actnorm_scale(name, x, scale=1., logdet=None, logscale_factor=3., batch_vari
             dlogdet = tf.reduce_sum(logs) * logdet_factor
             if reverse:
                 dlogdet *= -1
+            # pre logdet + this logdet
             return x, logdet + dlogdet
+        # }}
 
         return x
 
@@ -204,6 +225,7 @@ def add_edge_padding(x, filter_size):
     assert filter_size[0] % 2 == 1
     if filter_size[0] == 1 and filter_size[1] == 1:
         return x
+    # a = b = 1
     a = (filter_size[0] - 1) // 2  # vertical padding size
     b = (filter_size[1] - 1) // 2  # horizontal padding size
     if True:
@@ -213,6 +235,7 @@ def add_edge_padding(x, filter_size):
         if not pads:
             if hvd.rank() == 0:
                 print("Creating pad", name)
+
             pad = np.zeros([1] + int_shape(x)[1:3] + [1], dtype='float32')
             pad[:, :a, :, 0] = 1.
             pad[:, -a:, :, 0] = 1.
@@ -223,6 +246,14 @@ def add_edge_padding(x, filter_size):
         else:
             pad = pads[0]
         pad = tf.tile(pad, [tf.shape(x)[0], 1, 1, 1])
+        # pad as a new channel
+        # x add a new channel as
+        # BUT, WHY ???
+        # 1 1 1 1 1
+        # 1 0 0 0 1
+        # 1 0 0 0 1
+        # 1 0 0 0 1
+        # 1 1 1 1 1
         x = tf.concat([x, pad], axis=3)
     else:
         pad = tf.pad(tf.zeros_like(x[:, :, :, :1]) - 1,
@@ -299,6 +330,8 @@ def conv2d_zeros(name, x, width, filter_size=[3, 3], stride=[1, 1], pad="SAME", 
         n_in = int(x.get_shape()[3])
         stride_shape = [1] + stride + [1]
         filter_shape = filter_size + [n_in, width]
+
+        # w is initialized by zeros
         w = tf.get_variable("W", filter_shape, tf.float32,
                             initializer=tf.zeros_initializer())
         if skip == 1:
@@ -444,10 +477,13 @@ def gaussian_diag(mean, logsd):
     class o(object):
         pass
     o.mean = mean
+    # sd: standard deviant
     o.logsd = logsd
     o.eps = tf.random_normal(tf.shape(mean))
     o.sample = mean + tf.exp(logsd) * o.eps
     o.sample2 = lambda eps: mean + tf.exp(logsd) * eps
+
+    # prior_p ~ N(x, mean, exp(2*logsd))
     o.logps = lambda x: -0.5 * \
         (np.log(2 * np.pi) + 2. * logsd + (x - mean) ** 2 / tf.exp(2. * logsd))
     o.logp = lambda x: flatten_sum(o.logps(x))
